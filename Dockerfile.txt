@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  ModxTube · yt-dlp FastAPI Backend
+#  Works on Railway, Render, Fly.io, or any plain Docker/VPS host.
+#
+#  Build:   docker build -t modxtube-api .
+#  Run:     docker run -p 8000:8000 modxtube-api
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: slim Python base ─────────────────────────────────────────────────
+FROM python:3.12-slim AS base
+
+# Keeps Python from writing .pyc files and enables unbuffered stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Railway / Render inject $PORT; default to 8000 for local use
+    PORT=8000
+
+# ── System deps ───────────────────────────────────────────────────────────────
+# ffmpeg is required by yt-dlp to merge separate video+audio streams.
+# ca-certificates ensures HTTPS requests work in the container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── App user (non-root) ───────────────────────────────────────────────────────
+RUN useradd --create-home --shell /bin/bash appuser
+WORKDIR /app
+
+# ── Python deps ───────────────────────────────────────────────────────────────
+# Copy only requirements first so Docker can cache this layer independently
+# of source-code changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── App source ────────────────────────────────────────────────────────────────
+COPY main.py .
+
+# Drop root privileges
+USER appuser
+
+# ── Healthcheck ───────────────────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/')"
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+# $PORT is provided at runtime by Railway/Render/Fly; falls back to 8000 locally.
+# --workers 1 is intentional: yt-dlp spawns its own subprocesses, and
+# multiple Uvicorn workers each spawning yt-dlp subprocesses can exhaust
+# memory quickly on small instances. Scale horizontally instead.
+CMD uvicorn main:app \
+        --host 0.0.0.0 \
+        --port "${PORT}" \
+        --workers 1 \
+        --log-level info

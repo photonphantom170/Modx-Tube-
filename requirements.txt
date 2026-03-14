@@ -1,0 +1,8 @@
+# ── Runtime ───────────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+yt-dlp==2025.1.26        # pin a known-good release; bump manually as needed
+
+# ── Optional but recommended ──────────────────────────────────────────────────
+# httpx is used by yt-dlp for some extraction paths
+httpx==0.28.1
