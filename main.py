@@ -1,17 +1,23 @@
 """
-yt-dlp FastAPI Backend
-Replaces Piped/Invidious with a direct yt-dlp integration.
+yt-dlp FastAPI Backend — ModxTube
 Endpoints:
-  GET /metadata/{video_id}  - title, description, thumbnails, formats
-  GET /stream/{video_id}    - direct playable URL (m3u8 / mp4)
+  GET /                          - health check
+  GET /metadata/{video_id}       - video metadata via yt-dlp
+  GET /stream/{video_id}         - direct stream URL via yt-dlp
+  GET /search?q=...              - search videos (proxies Piped)
+  GET /trending                  - trending videos (proxies Piped)
+  GET /comments/{video_id}       - video comments (proxies Piped)
+  GET /streams/{video_id}        - video details/recs (proxies Piped)
+  GET /channel/{channel_id}      - channel info (proxies Piped)
 """
 
 import asyncio
 import json
-import subprocess
 import sys
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,56 +26,78 @@ from pydantic import BaseModel
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="yt-dlp Proxy API",
-    description="Lightweight API that wraps yt-dlp to serve YouTube metadata and stream URLs.",
-    version="1.0.0",
-)
+app = FastAPI(title="ModxTube API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten this in production
+    allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 YT_URL_TEMPLATE = "https://www.youtube.com/watch?v={video_id}"
 
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://piped-api.garudalinux.org",
+    "https://api.piped.projectsegfau.lt",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.tokhmi.xyz",
+    "https://piped.video/api",
+    "https://pipedapi.leptons.xyz",
+]
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Piped proxy helper  (server-side — no CORS issues)
+# ---------------------------------------------------------------------------
+
+async def piped_fetch(path: str) -> Any:
+    """Try each Piped instance until one succeeds. Runs server-side so no CORS."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        last_err: Exception | None = None
+        for base in PIPED_INSTANCES:
+            try:
+                r = await client.get(
+                    base + path,
+                    headers={"Accept": "application/json"},
+                    follow_redirects=True,
+                )
+                if r.status_code == 200:
+                    return r.json()
+                last_err = Exception(f"HTTP {r.status_code} from {base}")
+            except Exception as e:
+                last_err = e
+                continue
+    raise HTTPException(status_code=502, detail=f"All Piped instances failed: {last_err}")
+
+
+# ---------------------------------------------------------------------------
+# yt-dlp helpers
 # ---------------------------------------------------------------------------
 
 class YtDlpError(Exception):
-    """Raised when yt-dlp returns a non-zero exit code."""
     def __init__(self, message: str, stderr: str = ""):
         super().__init__(message)
         self.stderr = stderr
 
 
 def _classify_error(stderr: str) -> tuple[int, str]:
-    """
-    Map common yt-dlp error strings to appropriate HTTP status codes
-    and user-friendly messages.
-    """
     lower = stderr.lower()
     if "private video" in lower:
-        return 403, "This video is private and cannot be accessed."
+        return 403, "This video is private."
     if "age" in lower and ("restricted" in lower or "confirmation" in lower):
-        return 451, "This video is age-restricted. Authentication (cookies) may be required."
+        return 451, "This video is age-restricted."
     if "video unavailable" in lower or "has been removed" in lower:
         return 404, "This video is unavailable or has been removed."
     if "copyright" in lower:
-        return 451, "This video is blocked due to a copyright claim in your region."
+        return 451, "This video is blocked due to copyright."
     if "premieres" in lower or "upcoming" in lower:
         return 425, "This video has not premiered yet."
     return 500, f"yt-dlp error: {stderr.strip()[:300]}"
 
 
 async def _run_ytdlp(*args: str) -> str:
-    """
-    Run yt-dlp as a subprocess and return stdout.
-    Raises YtDlpError on non-zero exit.
-    """
     cmd = [sys.executable, "-m", "yt_dlp", *args]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -77,34 +105,24 @@ async def _run_ytdlp(*args: str) -> str:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
-
     if proc.returncode != 0:
-        raise YtDlpError("yt-dlp subprocess failed", stderr.decode(errors="replace"))
-
+        raise YtDlpError("yt-dlp failed", stderr.decode(errors="replace"))
     return stdout.decode(errors="replace")
 
 
 async def _dump_json(video_id: str) -> dict[str, Any]:
-    """Fetch full video metadata via --dump-json."""
     raw = await _run_ytdlp(
-        "--dump-json",
-        "--no-playlist",
-        "--no-warnings",
+        "--dump-json", "--no-playlist", "--no-warnings",
         YT_URL_TEMPLATE.format(video_id=video_id),
     )
     return json.loads(raw)
 
 
-async def _get_url(video_id: str, format_selector: str) -> str:
-    """Fetch the direct stream URL via --get-url."""
+async def _get_url(video_id: str, fmt: str) -> str:
     raw = await _run_ytdlp(
-        "--get-url",
-        "--no-playlist",
-        "--no-warnings",
-        "-f", format_selector,
-        YT_URL_TEMPLATE.format(video_id=video_id),
+        "--get-url", "--no-playlist", "--no-warnings",
+        "-f", fmt, YT_URL_TEMPLATE.format(video_id=video_id),
     )
-    # --get-url may return multiple lines (audio + video); return the first non-empty line
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     if not lines:
         raise YtDlpError("yt-dlp returned no URL")
@@ -112,7 +130,7 @@ async def _get_url(video_id: str, format_selector: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic response models
+# Pydantic models
 # ---------------------------------------------------------------------------
 
 class Thumbnail(BaseModel):
@@ -130,16 +148,15 @@ class Format(BaseModel):
     vcodec: str | None = None
     acodec: str | None = None
     filesize: int | None = None
-    tbr: float | None = None          # total bitrate (kbps)
-    url: str | None = None            # only populated if caller requests it
+    tbr: float | None = None
 
 
 class MetadataResponse(BaseModel):
     video_id: str
     title: str
     description: str | None
-    duration: int | None              # seconds
-    upload_date: str | None           # YYYYMMDD
+    duration: int | None
+    upload_date: str | None
     uploader: str | None
     uploader_url: str | None
     view_count: int | None
@@ -160,21 +177,13 @@ class StreamResponse(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.get("/", summary="Health check")
+@app.get("/")
 async def root():
-    return {"status": "ok", "service": "yt-dlp proxy"}
+    return {"status": "ok", "service": "ModxTube API"}
 
 
-@app.get(
-    "/metadata/{video_id}",
-    response_model=MetadataResponse,
-    summary="Get video metadata",
-)
+@app.get("/metadata/{video_id}", response_model=MetadataResponse)
 async def get_metadata(video_id: str):
-    """
-    Returns title, description, thumbnails, and all available formats
-    for the given YouTube video ID.
-    """
     try:
         data = await _dump_json(video_id)
     except YtDlpError as exc:
@@ -183,39 +192,24 @@ async def get_metadata(video_id: str):
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="yt-dlp returned invalid JSON.")
 
-    # Parse thumbnails
-    thumbnails: list[Thumbnail] = [
-        Thumbnail(
-            url=t.get("url", ""),
-            width=t.get("width"),
-            height=t.get("height"),
-            id=t.get("id"),
-        )
-        for t in (data.get("thumbnails") or [])
-        if t.get("url")
+    thumbnails = [
+        Thumbnail(url=t.get("url",""), width=t.get("width"), height=t.get("height"), id=t.get("id"))
+        for t in (data.get("thumbnails") or []) if t.get("url")
     ]
-
-    # Parse formats — omit raw URLs by default (they expire quickly)
-    formats: list[Format] = [
+    formats = [
         Format(
-            format_id=f.get("format_id", ""),
-            ext=f.get("ext", ""),
+            format_id=f.get("format_id",""), ext=f.get("ext",""),
             resolution=f.get("resolution") or (
-                f"{f['width']}x{f['height']}"
-                if f.get("width") and f.get("height") else None
+                f"{f['width']}x{f['height']}" if f.get("width") and f.get("height") else None
             ),
-            fps=f.get("fps"),
-            vcodec=f.get("vcodec"),
-            acodec=f.get("acodec"),
-            filesize=f.get("filesize"),
-            tbr=f.get("tbr"),
+            fps=f.get("fps"), vcodec=f.get("vcodec"), acodec=f.get("acodec"),
+            filesize=f.get("filesize"), tbr=f.get("tbr"),
         )
         for f in (data.get("formats") or [])
     ]
-
     return MetadataResponse(
         video_id=video_id,
-        title=data.get("title", ""),
+        title=data.get("title",""),
         description=data.get("description"),
         duration=data.get("duration"),
         upload_date=data.get("upload_date"),
@@ -228,43 +222,19 @@ async def get_metadata(video_id: str):
     )
 
 
-@app.get(
-    "/stream/{video_id}",
-    response_model=StreamResponse,
-    summary="Get direct stream URL",
-)
+@app.get("/stream/{video_id}", response_model=StreamResponse)
 async def get_stream(
     video_id: str,
-    quality: str = Query(
-        default="best",
-        description=(
-            "yt-dlp format selector. "
-            "Examples: 'best', 'bestvideo+bestaudio', '22', 'bestvideo[height<=720]+bestaudio'"
-        ),
-    ),
-    prefer_hls: bool = Query(
-        default=True,
-        description="Prefer HLS (m3u8) streams when available.",
-    ),
+    quality: str = Query(default="best"),
+    prefer_hls: bool = Query(default=True),
 ):
-    """
-    Returns the direct playable URL for a given video.
-
-    - Use `quality=best` for the highest available quality.
-    - Use `quality=bestvideo[height<=1080]+bestaudio/best` for merged streams.
-    - Set `prefer_hls=true` to prefer HLS/m3u8 (better for in-browser playback).
-    """
-    # Build format selector
-    if prefer_hls:
-        # Try HLS first, fall back to the caller's quality preference
-        format_selector = f"({quality})[protocol^=m3u8]/({quality})[protocol=m3u8_native]/{quality}"
-    else:
-        format_selector = quality
-
+    fmt = (
+        f"({quality})[protocol^=m3u8]/({quality})[protocol=m3u8_native]/{quality}"
+        if prefer_hls else quality
+    )
     try:
-        url = await _get_url(video_id, format_selector)
+        url = await _get_url(video_id, fmt)
     except YtDlpError as exc:
-        # If HLS preference caused a failure, retry without HLS filter
         if prefer_hls:
             try:
                 url = await _get_url(video_id, quality)
@@ -275,15 +245,52 @@ async def get_stream(
             code, msg = _classify_error(exc.stderr)
             raise HTTPException(status_code=code, detail=msg)
 
-    is_hls = "m3u8" in url or ".m3u8" in url
-
-    # Determine format_id and ext from the URL heuristically
+    is_hls = "m3u8" in url
     ext = "m3u8" if is_hls else ("mp4" if ".mp4" in url else "unknown")
+    return StreamResponse(video_id=video_id, url=url, format_id=quality, ext=ext, is_hls=is_hls)
 
-    return StreamResponse(
-        video_id=video_id,
-        url=url,
-        format_id=quality,
-        ext=ext,
-        is_hls=is_hls,
-    )
+
+# ── Piped proxy routes (browser calls these; we call Piped server-side) ──────
+
+@app.get("/search")
+async def search(
+    q: str = Query(...),
+    nextpage: str = Query(default=""),
+):
+    path = f"/search?q={quote(q)}&filter=videos"
+    if nextpage:
+        path += f"&nextpage={quote(nextpage)}"
+    return await piped_fetch(path)
+
+
+@app.get("/trending")
+async def trending(region: str = Query(default="US")):
+    return await piped_fetch(f"/trending?region={region}")
+
+
+@app.get("/comments/{video_id}")
+async def comments(video_id: str):
+    return await piped_fetch(f"/comments/{video_id}")
+
+
+@app.get("/streams/{video_id}")
+async def streams_piped(video_id: str):
+    return await piped_fetch(f"/streams/{video_id}")
+
+
+@app.get("/channel/{channel_id}/playlists")
+async def channel_playlists(channel_id: str):
+    return await piped_fetch(f"/channel/{channel_id}/playlists")
+
+
+@app.get("/channel/{channel_id}/videos")
+async def channel_videos(channel_id: str, nextpage: str = Query(default="")):
+    path = f"/nextpage/channel/{channel_id}"
+    if nextpage:
+        path += f"?nextpage={quote(nextpage)}"
+    return await piped_fetch(path)
+
+
+@app.get("/channel/{channel_id}")
+async def channel(channel_id: str):
+    return await piped_fetch(f"/channel/{channel_id}")
